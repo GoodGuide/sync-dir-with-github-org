@@ -24,7 +24,7 @@ def prompt(ask)
 end
 
 def fixit(expected, actual, desc, &correction)
-  unless current_url == repo.ssh_url
+  unless expected == actual
     warn "#{desc} is incorrect:"
     warn "  expected: #{expected}"
     warn "  got:      #{actual}"
