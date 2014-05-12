@@ -3,15 +3,7 @@
 require 'octokit'
 require 'pathname'
 require 'pry'
-
-ROOT_PATH = Pathname.new(File.dirname(__FILE__))
-
-client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
-client.auto_paginate = true
-
-STDERR.print 'Fetching all GoodGuide repos... '
-goodguide_repos = client.org_repos('GoodGuide')
-warn "Got #{goodguide_repos.count} repos"
+require 'optparse'
 
 def system(command)
   STDERR.puts "  > #{command}"
@@ -23,25 +15,49 @@ def prompt(ask)
   STDIN.gets.chomp.downcase[0] == 'y'
 end
 
-def fixit(expected, actual, desc, &correction)
-  unless expected == actual
-    warn "#{desc} is incorrect:"
-    warn "  expected: #{expected}"
-    warn "  got:      #{actual}"
-    if prompt('Fix it?')
-      correction.call
-    end
-  end
+def fixit(desc, expected, actual, should_correct=nil, &correction)
+  return if expected == actual
+
+  warn "#{desc} is incorrect:"
+  warn "  expected: #{expected}"
+  warn "  got:      #{actual}"
+
+  should_correct = prompt('Fix it?') if should_correct.nil?
+  correction.call if should_correct
 end
+
+ROOT_PATH = Pathname.new(File.dirname(__FILE__))
+
+options = {}
+OptionParser.new do |opts|
+  opts.banner = "Usage: #{$0} [options]"
+
+  opts.on("-f", "--[no-]fix-remotes", "Always fix git remotes URLs; default is to prompt.") do |v|
+    options[:always_fix_remotes] = v
+  end
+
+  opts.on("-C", "--[no-]clone-missing", "Always clone missing repos including forks; default is to prompt") do |v|
+    options[:always_clone_missing] = v
+  end
+end.parse!
+
+client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
+client.auto_paginate = true
+
+STDERR.print 'Fetching all GoodGuide repos... '
+goodguide_repos = client.org_repos('GoodGuide')
+warn "Got #{goodguide_repos.count} repos"
 
 goodguide_repos.each do |repo|
   warn "\n#{repo.full_name} ".ljust(80, '_')
+
+  just_cloned = false
 
   directory = ROOT_PATH.join(repo.name)
   if directory.directory?
     Dir.chdir(directory.to_s) do
       current_url = `git config remote.origin.url`.chomp
-      fixit(repo.ssh_url, current_url, 'Current remote URL') do
+      fixit('Current remote URL', repo.ssh_url, current_url, options[:always_fix_remotes]) do
         system "git config remote.origin.url #{repo.ssh_url}"
       end
 
@@ -51,10 +67,14 @@ goodguide_repos.each do |repo|
 
   else
     if repo.fork
-      next unless prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
+      should_clone = options.fetch(:always_clone_missing) {
+        prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
+      }
+      next unless should_clone
     end
 
     system "git clone --recursive #{repo.ssh_url} ./#{repo.name}"
+    just_cloned = true
   end
 
   if repo.fork
@@ -65,15 +85,17 @@ goodguide_repos.each do |repo|
     Dir.chdir(directory.to_s) do
       current_upstream_url = `git config remote.upstream.url`.chomp
       current_upstream_url = nil unless $?.success?
-      fixit(repo.parent.ssh_url, current_upstream_url, 'Upstream remote URL') do
-        if current_upstream_url == nil
+      fixit('Upstream remote URL', repo.parent.ssh_url, current_upstream_url, just_cloned || options[:always_fix_remotes]) do
+        if current_upstream_url.nil?
           system "git remote add upstream #{repo.parent.ssh_url}"
         else
           system "git remote set-url upstream #{repo.parent.ssh_url}"
         end
+
+        current_upstream_url = repo.parent.ssh_url
       end
 
-      system "git fetch upstream --prune --tags --recurse-submodules=yes"
+      system "git fetch upstream --prune --tags --recurse-submodules=yes" unless current_upstream_url.nil?
     end
   end
 end
