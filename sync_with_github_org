@@ -1,0 +1,79 @@
+#!/usr/bin/env ruby
+
+require 'octokit'
+require 'pathname'
+require 'pry'
+
+ROOT_PATH = Pathname.new(File.dirname(__FILE__))
+
+client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
+client.auto_paginate = true
+
+STDERR.print 'Fetching all GoodGuide repos... '
+goodguide_repos = client.org_repos('GoodGuide')
+warn "Got #{goodguide_repos.count} repos"
+
+def system(command)
+  STDERR.puts "  > #{command}"
+  Kernel.system command
+end
+
+def prompt(ask)
+  STDERR.print(ask << ' ')
+  STDIN.gets.chomp.downcase[0] == 'y'
+end
+
+def fixit(expected, actual, desc, &correction)
+  unless current_url == repo.ssh_url
+    warn "#{desc} is incorrect:"
+    warn "  expected: #{expected}"
+    warn "  got:      #{actual}"
+    if prompt('Fix it?')
+      correction.call
+    end
+  end
+end
+
+goodguide_repos.each do |repo|
+  warn "\n#{repo.full_name} ".ljust(80, '_')
+
+  directory = ROOT_PATH.join(repo.name)
+  if directory.directory?
+    Dir.chdir(directory.to_s) do
+      current_url = `git config remote.origin.url`.chomp
+      fixit(repo.ssh_url, current_url, 'Current remote URL') do
+        system "git config remote.origin.url #{repo.ssh_url}"
+      end
+
+      system "git fetch origin --prune --tags --recurse-submodules=yes"
+      system "git submodule init"
+    end
+
+  else
+    if repo.fork
+      next unless prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
+    end
+
+    system "git clone --recursive #{repo.ssh_url} ./#{repo.name}"
+  end
+
+  if repo.fork
+    warn "fetching more detail..."
+    # replace with full object via /repos/:name
+    repo = client.repo(repo.full_name)
+
+    Dir.chdir(directory.to_s) do
+      current_upstream_url = `git config remote.upstream.url`.chomp
+      current_upstream_url = nil unless $?.success?
+      fixit(repo.parent.ssh_url, current_upstream_url, 'Upstream remote URL') do
+        if current_upstream_url == nil
+          system "git remote add upstream #{repo.parent.ssh_url}"
+        else
+          system "git remote set-url upstream #{repo.parent.ssh_url}"
+        end
+      end
+
+      system "git fetch upstream --prune --tags --recurse-submodules=yes"
+    end
+  end
+end
