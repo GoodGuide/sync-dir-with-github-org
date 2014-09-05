@@ -1,9 +1,12 @@
 #!/usr/bin/env ruby
 
-require 'octokit'
 require 'pathname'
-require 'pry'
 require 'optparse'
+
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __FILE__)
+require 'bundler/setup'
+require 'octokit'
+require 'pry'
 
 def system(command)
   STDERR.puts "  > #{command}"
