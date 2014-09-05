@@ -39,6 +39,10 @@ OptionParser.new do |opts|
   opts.on("-C", "--[no-]clone-missing", "Always clone missing repos including forks; default is to prompt") do |v|
     options[:always_clone_missing] = v
   end
+
+  opts.on("--ignore-legacy-repos", "Ignore repos with a name starting with 'legacy-'") do |v|
+    options[:ignore_legacy] = v
+  end
 end.parse!
 
 client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
@@ -48,12 +52,23 @@ STDERR.print 'Fetching all GoodGuide repos... '
 goodguide_repos = client.org_repos('GoodGuide')
 warn "Got #{goodguide_repos.count} repos"
 
+repo_directories = []
+
 goodguide_repos.each do |repo|
   warn "\n#{repo.full_name} ".ljust(80, '_')
 
   just_cloned = false
 
   directory = ROOT_PATH.join(repo.name)
+
+  # track for later
+  repo_directories << directory
+
+  if repo.name.start_with?('legacy-') and options[:ignore_legacy]
+    warn "Skipping legacy repo"
+    next
+  end
+
   if directory.directory?
     Dir.chdir(directory.to_s) do
       current_url = `git config remote.origin.url`.chomp
@@ -98,4 +113,24 @@ goodguide_repos.each do |repo|
       system "git fetch upstream --prune --tags --recurse-submodules=yes" unless current_upstream_url.nil?
     end
   end
+
+  hooksdir = directory.join('.git', 'hooks')
+  if hooksdir.symlink?
+    hooksdir.delete
+    Process.spawn('goodguide-git-hooks', 'install', chdir: directory.to_s)
+    Process.wait
+  end
+end
+
+dirs = []
+ROOT_PATH.each_child do |e|
+  next unless e.directory?
+  dirs << e
+end
+
+untracked_dirs = dirs - repo_directories
+
+if untracked_dirs.count > 0
+  puts "There are %i untracked directories in the tree:" % untracked_dirs.count
+  puts untracked_dirs
 end
