@@ -8,6 +8,9 @@ ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', file)
 require 'bundler/setup'
 require 'octokit'
 require 'pry'
+require 'concurrent'
+
+ROOT_PATH = Pathname.new(Dir.getwd)
 
 def system(command)
   STDERR.puts "  > #{command}"
@@ -30,36 +33,72 @@ def fixit(desc, expected, actual, should_correct=nil, &correction)
   correction.call if should_correct
 end
 
-ROOT_PATH = Pathname.new(File.dirname(__FILE__))
 
-options = {}
-OptionParser.new do |opts|
-  opts.banner = "Usage: #{$0} [options]"
+def options
+  @options ||= {}
+end
 
-  opts.on("-f", "--[no-]fix-remotes", "Always fix git remotes URLs; default is to prompt.") do |v|
-    options[:always_fix_remotes] = v
-  end
+def opt_parser
+  @opt_parser ||= OptionParser.new { |opts|
+    opts.banner = "Usage: #{$0} [options]"
 
-  opts.on("-C", "--[no-]clone-missing", "Always clone missing repos including forks; default is to prompt") do |v|
-    options[:always_clone_missing] = v
-  end
+    opts.on("-f", "--[no-]fix-remotes", "Always fix git remotes URLs; default is to prompt.") do |v|
+      options[:always_fix_remotes] = v
+    end
 
-  opts.on("--ignore-legacy-repos", "Ignore repos with a name starting with 'legacy-'") do |v|
-    options[:ignore_legacy] = v
-  end
-end.parse!
+    opts.on("-C", "--[no-]clone-missing", "Always clone missing repos including forks; default is to prompt") do |v|
+      options[:always_clone_missing] = v
+    end
+
+    opts.on("--ignore-legacy-repos", "Ignore repos with a name starting with 'legacy-'") do |v|
+      options[:ignore_legacy] = v
+    end
+  }
+end
+
+def run_async
+  options_which_inhibit_prompting = [:always_clone_missing, :always_fix_remotes]
+  (options_which_inhibit_prompting & options.keys) == options_which_inhibit_prompting
+end
+
+opt_parser.parse!
+
+puts 'SHOULD RUN ASYNC' if run_async
 
 client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
 client.auto_paginate = true
 
-STDERR.print 'Fetching all GoodGuide repos... '
-goodguide_repos = client.org_repos('GoodGuide')
-warn "Got #{goodguide_repos.count} repos"
+org_name = ARGV[0] || ROOT_PATH.basename.to_s
+
+STDERR.print "Fetching all '#{org_name}' repos... "
+org_repos = client.org_repos(org_name).sort_by(&:full_name)
+warn "Got #{org_repos.count} repos"
 
 repo_directories = []
 
-goodguide_repos.each do |repo|
-  warn "\n#{repo.full_name} ".ljust(80, '_')
+def capture(*args)
+  opts = args.pop if args.last.is_a?(Hash)
+  r, w = IO.pipe
+  p args, opts
+  pid = Process.spawn(*args, opts.merge(out: w))
+  _, pstat = Process.wait2(pid)
+  pstat.success? or raise "Execution failed for #{args}"
+  w.close
+  r.read
+ensure
+  w.close unless w.closed?
+  r.close unless r.closed?
+end
+
+def run(*args)
+  p args
+  pid = Process.spawn(*args)
+  _, pstat = Process.wait2(pid)
+  pstat.success? or raise "Execution failed for #{args}"
+end
+
+promises = org_repos.map do |repo|
+  warn "- #{repo.full_name}"
 
   just_cloned = false
 
@@ -73,56 +112,77 @@ goodguide_repos.each do |repo|
     next
   end
 
-  if directory.directory?
-    Dir.chdir(directory.to_s) do
-      current_url = `git config remote.origin.url`.chomp
+  run_opts = { chdir: directory.to_s }
+
+  Concurrent::Promise.new(executor: Concurrent.configuration.global_task_pool) do
+    print "Starting for #{directory}\n"
+    if directory.directory?
+      current_url = capture('git', 'config', 'remote.origin.url', run_opts).chomp
       fixit('Current remote URL', repo.ssh_url, current_url, options[:always_fix_remotes]) do
-        system "git config remote.origin.url #{repo.ssh_url}"
+        run(*%W[git config remote.origin.url #{repo.ssh_url}], run_opts)
       end
 
-      system "git fetch origin --prune --tags --recurse-submodules=yes"
-      system "git submodule init"
+      run(*%w[git fetch origin --prune --tags --recurse-submodules=yes], run_opts)
+      run(*%w[git submodule init], run_opts)
+
+    else
+      if repo.fork
+        should_clone = options.fetch(:always_clone_missing) {
+          prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
+        }
+        next unless should_clone
+      end
+
+      run(*%W[git clone --recursive #{repo.ssh_url} ./#{repo.name}], run_opts)
+      just_cloned = true
     end
 
-  else
     if repo.fork
-      should_clone = options.fetch(:always_clone_missing) {
-        prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
-      }
-      next unless should_clone
-    end
+      # warn "fetching more detail..."
+      # replace with full object via /repos/:name
+      repo = client.repo(repo.full_name)
 
-    system "git clone --recursive #{repo.ssh_url} ./#{repo.name}"
-    just_cloned = true
-  end
-
-  if repo.fork
-    warn "fetching more detail..."
-    # replace with full object via /repos/:name
-    repo = client.repo(repo.full_name)
-
-    Dir.chdir(directory.to_s) do
-      current_upstream_url = `git config remote.upstream.url`.chomp
+      current_upstream_url = capture('git', 'config', 'remote.upstream.url', run_opts).chomp
       current_upstream_url = nil unless $?.success?
       fixit('Upstream remote URL', repo.parent.ssh_url, current_upstream_url, just_cloned || options[:always_fix_remotes]) do
         if current_upstream_url.nil?
-          system "git remote add upstream #{repo.parent.ssh_url}"
+          run(%W[git remote add upstream #{repo.parent.ssh_url}], run_opts)
         else
-          system "git remote set-url upstream #{repo.parent.ssh_url}"
+          run(%W[git remote set-url upstream #{repo.parent.ssh_url}], run_opts)
         end
 
         current_upstream_url = repo.parent.ssh_url
+
+        run(*%w[git fetch upstream --prune --tags --recurse-submodules=yes], run_opts) unless current_upstream_url.nil?
       end
-
-      system "git fetch upstream --prune --tags --recurse-submodules=yes" unless current_upstream_url.nil?
     end
-  end
 
-  hooksdir = directory.join('.git', 'hooks')
-  if hooksdir.symlink?
-    hooksdir.delete
-    Process.spawn('goodguide-git-hooks', 'install', chdir: directory.to_s)
-    Process.wait
+    hooksdir = directory.join('.git', 'hooks')
+    if hooksdir.symlink?
+      hooksdir.delete
+    end
+    run('goodguide-git-hooks', 'install', '--noclobber', chdir: directory.to_s)
+    print "Finished for #{directory}\n"
+  end
+end
+
+promises.compact!
+
+if run_async
+  promises.each(&:execute)
+else
+  promises.reduce(Concurrent::Promise.fulfill(true)) do |prev, this|
+    prev.then do
+      this.execute
+    end
+    this
+  end
+end
+
+Concurrent::Promise.all?(promises).wait.rescue do
+  promises.each do |promise|
+    next unless promise.rejected?
+    p promise.reason
   end
 end
 
