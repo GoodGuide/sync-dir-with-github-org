@@ -1,0 +1,490 @@
+#!/usr/bin/env ruby
+
+require 'pathname'
+require 'optparse'
+require 'stringio'
+require 'time'
+
+__file = File.symlink?(__FILE__) ? File.readlink(__FILE__) : __FILE__
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __file)
+require 'bundler/setup'
+require 'octokit'
+require 'pry'
+
+require 'time-lord' # nb: this monkey-patches Time/Numeric classes a lot
+
+# Monkey-patch time-lord gem as it doesn't round values by default, instead relying on Integer#/(Integer) which results in effectively a floor() operation. Over intervals of, say, 1.9 years, seeing just "1 year" as the output is rather misleading.
+module TimeLord
+  class Scale
+    def count(unit)
+      rounding_scale = unit >= YEAR ? 1 : 0
+      rounding_factor = 10 ** rounding_scale
+      if rounding_factor > 1
+        (absolute.to_f * rounding_factor / unit).round.to_f / rounding_factor
+      else
+        (absolute.to_f / unit).round
+      end
+    end
+
+    def plurality?(count)
+      (1 - count).abs > 0.1
+    end
+  end
+end
+
+module HelperMethods
+  def system(*command)
+    STDERR.puts "  > #{command.join(' ')}"
+    Kernel.system(*command)
+  end
+
+  def prompt(ask)
+    STDERR.print(ask << ' ')
+    STDIN.gets.chomp.downcase[0] == 'y'
+  end
+
+  def format_time(t)
+    t.ago.to_words
+  end
+
+  def committer(commit)
+    return commit.author.login if commit.author
+
+    '%s &lt;%s&gt;' % [commit.commit.author.name, commit.commit.author.email]
+  end
+
+  def link_to(url, text)
+    '[%s](%s)' % [text, url]
+  end
+end
+
+class RepoList
+  def initialize(client)
+    @client = client
+  end
+  attr_reader :client
+
+  def repos
+    cached_repos.map { |data|
+      gh_repo, last_commit, files_in_root = data.values_at(:repo, :last_commit, :files_in_root)
+      Repo.new(gh_repo) { |repo|
+        repo.last_commit = last_commit
+        repo.files_in_root = files_in_root
+      }
+    }
+  end
+
+  private
+
+  def cache
+    @cache ||= Cache.new('/tmp')
+  end
+
+  def cached_repos
+    @repos ||= cache.fetch('goodguide-repos.dat') do |ex|
+      warn "Loading repo cache failed: #{ex}"
+      warn 'Fetching all GoodGuide repos...'
+
+      goodguide_repos = client.org_repos('GoodGuide')
+        .sort_by { |r| r.name.downcase }
+        .tap { |repos| warn "Got #{repos.count} repos. Loading more information..." }
+
+      goodguide_repos
+        .each_with_index
+        .map { |gh_repo, idx|
+          warn "%3i/%3i - %s" % [idx, goodguide_repos.length, gh_repo.full_name]
+
+          if !!gh_repo.to_attrs[:fork]
+            STDERR.print '  repo is fork; fetching full repo for parent information...'
+            gh_repo = client.repo(gh_repo.full_name)
+            STDERR.print "!\n"
+          end
+
+          STDERR.print '  fetching contents of root directory of HEAD commit...'
+          files_in_root = client.contents(gh_repo.full_name, path: '/')
+          STDERR.print "!\n"
+
+          STDERR.print '  fetching details of HEAD commit...'
+          last_commit = client.commit(gh_repo.full_name, 'HEAD')
+          STDERR.print "!\n"
+
+          { repo: gh_repo, last_commit: last_commit, files_in_root: files_in_root }
+        }
+    end
+  end
+end
+
+class Cache
+  def initialize(tmp_directory)
+    @directory = Pathname.new(tmp_directory)
+  end
+
+  def fetch(path, &block)
+    filename = @directory.join(path)
+    Marshal.load(File.read(filename))
+  rescue => ex
+    data = block.call(ex)
+
+    File.write(filename, Marshal.dump(data))
+
+    data
+  end
+end
+
+class ReportBuilder
+  include HelperMethods
+
+  def initialize(repos:, rules:)
+    @repos = repos
+    @rules = rules
+    @output = StringIO.new
+  end
+  attr_reader :output, :repos, :rules
+
+  def prepare
+    return if @_prepared
+    repos.each do |repo|
+      rules.each do |rule|
+        rule.visit(repo)
+      end
+    end
+    @_prepared = true
+  end
+
+  def write(filename)
+    prepare
+
+    output.puts "# repos"
+
+    repos.each do |repo|
+      # next if repo.fork?
+      source = StringIO.new
+      source << "## #{link_to(repo.html_url, repo.name)}"
+      source << ' &#128274;' if repo.private
+      if repo.name != repo.new_name
+        source << " => `#{repo.new_name}`"
+      end
+      source << "\n\n"
+
+      repo.observations.each do |obs|
+        source.puts "- #{obs}"
+      end
+
+      recs = distill_recommendations(repo.recommendations)
+      recs.unshift('Rename as indicated') if repo.name != repo.new_name
+
+      if recs.any?
+        source.puts '- Recommendations:'
+        recs.each do |rec|
+          source.puts "  - #{rec}"
+        end
+      end
+
+      output.puts source.string
+      output.puts
+    end
+
+    File.write(filename, output.string)
+  end
+
+  def distill_recommendations(recommendations)
+    return [] if recommendations.empty?
+
+    translate_recommendations(sort_recommendations(recommendations.uniq)[0,1]).compact
+  end
+
+  def sort_recommendations(recs)
+    recs.sort { |a,b|
+      case a
+      when :keep, :more_evaluation_required
+        -1
+      when :safe_to_archive
+        if b == :keep
+          1
+        else
+          -1
+        end
+      when :delete, :archive
+        1 # delete should always be sorted to the end so others can override
+      when :evaluate_fork_for_deletion
+        if b == :delete
+          -1
+        else
+          1
+        end
+      else
+        0
+      end
+    }
+  end
+
+  def translate_recommendations(recs)
+    recs.map { |r|
+      case r
+      when :more_evaluation_required
+        "Investigate further"
+      when :safe_to_archive, :archive
+        "Archive"
+      when :keep
+        nil
+      when :delete
+        "Delete or Archive"
+      when :evaluate_fork_for_deletion
+        "Fork; Investigate further and delete if not in use"
+      when String
+        r
+      else
+        fail "Define message for symbol recommendation #{r.inspect}"
+      end
+    }
+  end
+
+end
+
+class Repo
+  def initialize(gh_repo, &block)
+    @gh_repo = gh_repo
+    @new_name = gh_repo.name
+    block.call(self)
+    @recommendations = []
+    @observations = []
+  end
+
+  attr_reader :recommendations, :observations
+  attr_accessor :last_commit, :new_name, :files_in_root
+
+  def method_missing(*args, &block)
+    @gh_repo.send(*args, &block)
+  end
+
+  def description?
+    !description.empty?
+  end
+
+  def description
+    @gh_repo.description.to_s
+  end
+
+  def fork?
+    !!@gh_repo.to_attrs[:fork]
+  end
+
+  def has_gemspec?
+    files_in_root.any? { |file| file.name.end_with?('.gemspec') }
+  end
+end
+
+module Rules
+  class Base
+    include HelperMethods
+
+    def matches?(repo)
+      false
+    end
+
+    def visit(repo)
+      return false unless matches?(repo)
+      repo.observations.concat(Array(observations(repo)))
+      repo.recommendations.concat(Array(recommendations(repo)))
+      true
+    end
+
+    def recommendations(repo)
+      nil
+    end
+
+    def observations(repo)
+      nil
+    end
+  end
+
+  class ReallyOld < Base
+    def initialize(max_age)
+      @before_date = Time.now - max_age
+    end
+
+    def matches?(repo)
+      repo.pushed_at < @before_date
+    end
+
+    def recommendations(repo)
+      :archive
+    end
+
+    def observations(repo)
+      # 'Not updated recently'
+    end
+  end
+
+  class LastUpdated < Base
+    def matches?(repo)
+      true
+    end
+
+    def observations(repo)
+      link_to(repo.last_commit.html_url, "Last updated #{format_time(repo.pushed_at)} by #{committer(repo.last_commit)}")
+    end
+  end
+
+  class Describe < Base
+    def matches?(repo)
+      repo.description?
+    end
+
+    def observations(repo)
+      "Description:\n> #{repo.description}"
+    end
+  end
+
+  class Legacy < Base
+    def matches?(repo)
+      repo.new_name.start_with?('legacy-') || (repo.description.downcase.include?('legacy') && !repo.description[/in.?use/])
+    end
+
+    def recommendations(repo)
+      :archive
+    end
+  end
+
+  class Fork < Base
+    def matches?(repo)
+      repo.fork?
+    end
+
+    def observations(repo)
+      "**fork** of #{link_to(repo.parent.html_url, repo.parent.full_name)}"
+    end
+
+    def recommendations(repo)
+      :evaluate_fork_for_deletion
+    end
+  end
+
+  class PatternMatch < Base
+    def initialize(name: nil, description: nil, recommendations: nil, observations: nil)
+      fail ArguementError unless name || description and recommendations || observations
+      @name_pattern = name
+      @description_pattern = description
+      @recommendations = recommendations
+      @observations = observations
+    end
+
+    def matches?(repo)
+      @name_pattern && @name_pattern.match(repo.new_name) or @description_pattern && @description_pattern.match(repo.description)
+    end
+
+    def observations(repo)
+      @observations
+    end
+
+    def recommendations(repo)
+      @recommendations
+    end
+  end
+
+  class Namespace < Base
+    def initialize(name_pattern:, namespace:)
+      @name_pattern = name_pattern
+      @namespace = namespace
+    end
+
+    def matches?(repo)
+      @name_pattern.match(repo.new_name)
+    end
+
+    def visit(repo)
+      super(repo) or return
+      repo.new_name = "#{@namespace}-#{repo.new_name}"
+    end
+  end
+
+  class Rename < Base
+    def initialize(pattern, replacement)
+      @pattern, @replacement = pattern, replacement
+    end
+
+    def matches?(repo)
+      @pattern.match(repo.new_name)
+    end
+
+    def visit(repo)
+      super(repo) or return
+      repo.new_name = repo.new_name.gsub(@pattern, @replacement)
+    end
+  end
+
+  class GemRepoRename < Rename
+    def matches?(repo)
+      repo.has_gemspec?
+    end
+  end
+
+  class Downcase < Base
+    def matches?(repo)
+      true
+    end
+
+    def visit(repo)
+      super(repo) or return
+      repo.new_name = repo.new_name.downcase
+    end
+  end
+end
+
+OUTPUT_FILENAME = '/tmp/goodguide-org-repos-report.md'.freeze
+
+@rules = [
+  Rules::LastUpdated.new,
+  Rules::Describe.new,
+  Rules::ReallyOld.new(3.years),
+  Rules::Legacy.new,
+  Rules::Fork.new,
+
+  Rules::PatternMatch.new(name: /\A(Android-GoodGuide-(App|SDK))\z/i, recommendations: :more_evaluation_required),
+
+  Rules::GemRepoRename.new(/\A(.+?)(?:-gem)?\z/, '\1-gem'),
+
+  Rules::Downcase.new,
+  Rules::Rename.new(/_/, '-'), # stop using underscores in repo names, to avoid any further confusion
+
+  Rules::Rename.new(/\Agoodguide-(.+)\z/, '\1'),
+  Rules::Rename.new(/\Aplatform\z/, 'purview-www'),
+  Rules::Rename.new(/\Aplatform-(.+)\z/, 'purview-\1'),
+  Rules::Rename.new(/\Aconsumer-(.+)\z/, 'goodguide-\1'),
+  Rules::Rename.new(/\Aandroid-goodguide-(.+)\z/i, 'goodguide-android-\1'),
+  Rules::Rename.new(/\Asolr-goodguide-config\z/i, 'goodguide-solr-config'),
+  Rules::Rename.new(/\Aios-consumer-data-analysis\z/i, 'goodguide-ios-data-analysis'),
+  Rules::Rename.new(/\Anlp.+api\z/i, 'nlpapi'),
+
+  Rules::Namespace.new(name_pattern: /\A(accounts|amazon-earth-day|www|api|nlpapi|ios|users-service|content|(accounts(-internal)?|nlpapi|content|api)-gem)\z/, namespace: 'goodguide'),
+
+  Rules::Namespace.new(name_pattern: /\A(dolt|dorc|dimwit|buffoon|dingbat|muppeteer)/, namespace: 'data-run'),
+
+
+  Rules::Namespace.new(name_pattern: /\A(platform)|\A(target-products|rules|regression-tests)\z/, namespace: 'purview'),
+
+  Rules::PatternMatch.new(description: /\b(ARCHIVE|DEPRECATED)\b/i, recommendations: :safe_to_archive),
+  Rules::PatternMatch.new(name: /\A(deploy)\z/, recommendations: :keep),
+  Rules::PatternMatch.new(description: /in.use/, recommendations: :keep),
+
+  Rules::PatternMatch.new(name: /\bspike\b/, description: /hack|experiment|w\.?i\.?p\.?|temporary/i, recommendations: :safe_to_archive),
+  Rules::PatternMatch.new(name: /style-guide/i, recommendations: 'Valid to keep around if we review the rules'),
+
+  Rules::PatternMatch.new(name: /\A(jenkins)\z/i, recommendations: :keep),
+
+  Rules::PatternMatch.new(name: /\Ahorde/i, recommendations: :safe_to_archive),
+]
+
+@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |client|
+  client.auto_paginate = true
+}
+
+@repolist = RepoList.new(@client)
+
+@builder = ReportBuilder.new(repos: @repolist.repos, rules: @rules)
+@builder.prepare
+@builder.write(OUTPUT_FILENAME)
+
+puts "Wrote out to #{OUTPUT_FILENAME}"
+
+# system 'open', OUTPUT_FILENAME

@@ -30,7 +30,7 @@ def fixit(desc, expected, actual, should_correct=nil, &correction)
   correction.call if should_correct
 end
 
-ROOT_PATH = Pathname.new(File.dirname(__FILE__))
+ROOT_PATH = Pathname.new(Dir.getwd)
 
 options = {}
 OptionParser.new do |opts|
@@ -40,8 +40,12 @@ OptionParser.new do |opts|
     options[:always_fix_remotes] = v
   end
 
-  opts.on("-C", "--[no-]clone-missing", "Always clone missing repos including forks; default is to prompt") do |v|
+  opts.on("-C", "--[no-]clone-missing", "Always clone missing repos (not including forks); default is to prompt") do |v|
     options[:always_clone_missing] = v
+  end
+
+  opts.on('-F', '--[no-]include-forks', 'Clone missing forks') do |v|
+    options[:include_forks] = v
   end
 
   opts.on("--ignore-legacy-repos", "Ignore repos with a name starting with 'legacy-'") do |v|
@@ -57,6 +61,7 @@ goodguide_repos = client.org_repos('GoodGuide')
 warn "Got #{goodguide_repos.count} repos"
 
 repo_directories = []
+fork_directories = []
 
 goodguide_repos.each do |repo|
   warn "\n#{repo.full_name} ".ljust(80, '_')
@@ -73,7 +78,12 @@ goodguide_repos.each do |repo|
     next
   end
 
+
   if directory.directory?
+    if repo.fork
+      fork_directories << directory
+    end
+
     Dir.chdir(directory.to_s) do
       current_url = `git config remote.origin.url`.chomp
       fixit('Current remote URL', repo.ssh_url, current_url, options[:always_fix_remotes]) do
@@ -82,11 +92,12 @@ goodguide_repos.each do |repo|
 
       system "git fetch origin --prune --tags --recurse-submodules=yes"
       system "git submodule init"
+      system "git merge --ff-only"
     end
 
   else
     if repo.fork
-      should_clone = options.fetch(:always_clone_missing) {
+      should_clone = options.fetch(:include_forks) {
         prompt("Repo is a fork and isn't yet cloned at ./#{directory}; clone anyway?")
       }
       next unless should_clone
@@ -115,6 +126,7 @@ goodguide_repos.each do |repo|
       end
 
       system "git fetch upstream --prune --tags --recurse-submodules=yes" unless current_upstream_url.nil?
+      system "git merge --ff-only"
     end
   end
 
@@ -135,6 +147,13 @@ end
 untracked_dirs = dirs - repo_directories
 
 if untracked_dirs.count > 0
+  puts
   puts "There are %i untracked directories in the tree:" % untracked_dirs.count
   puts untracked_dirs
+end
+
+if fork_directories.count > 0
+  puts
+  puts "Forks:"
+  puts fork_directories
 end
