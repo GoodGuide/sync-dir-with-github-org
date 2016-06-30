@@ -85,9 +85,8 @@ class ReportBuilder
   def initialize(repos:, rules:)
     @repos = repos
     @rules = rules
-    @output = StringIO.new
   end
-  attr_reader :output, :repos, :rules
+  attr_reader :repos, :rules
 
   def prepare
     return if @_prepared
@@ -113,7 +112,7 @@ class ReportBuilder
     end
   end
 
-  def write(filename)
+  def write(output)
     prepare
 
     output.puts "# repos"
@@ -145,8 +144,6 @@ class ReportBuilder
       output.puts source.string
       output.puts
     end
-
-    File.write(filename, output.string)
   end
 
   def distill_recommendations(recommendations)
@@ -393,8 +390,6 @@ module Rules
   end
 end
 
-OUTPUT_FILENAME = '/tmp/goodguide-org-repos-report.md'.freeze
-
 @rules = [
   Rules::LastUpdated.new,
   Rules::Describe.new,
@@ -439,6 +434,7 @@ OUTPUT_FILENAME = '/tmp/goodguide-org-repos-report.md'.freeze
   Rules::PatternMatch.new(name: /\A(jenkins)\z/i, recommendations: :keep),
 
   Rules::PatternMatch.new(name: /\Apurview-rules\z/i, recommendations: :safe_to_archive),
+  Rules::PatternMatch.new(name: /\Ascorecard\z/i, recommendations: 'Talk to Bill about this.'),
 
   Rules::PatternMatch.new(name: /\Ahorde/i, recommendations: :safe_to_archive),
   Rules::PatternMatch.new(name: /\Aprezto\z/i, recommendations: 'Used by `dotfiles` repo. Evalutate if that is worth keeping around and if we still need to have a fork of prezto as well.'),
@@ -450,8 +446,4 @@ repo_data_filename = ARGV[0] or fail 'You must pass a filename to load repo data
 
 @builder = ReportBuilder.new(repos: @repolist.repos, rules: @rules)
 @builder.prepare
-@builder.write(OUTPUT_FILENAME)
-
-puts "Wrote out to #{OUTPUT_FILENAME}"
-
-# system 'open', OUTPUT_FILENAME
+@builder.write(STDOUT)
