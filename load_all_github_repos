@@ -1,0 +1,60 @@
+#!/usr/bin/env ruby
+
+require 'pathname'
+require 'optparse'
+require 'time'
+
+__file = File.symlink?(__FILE__) ? File.readlink(__FILE__) : __FILE__
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __file)
+require 'bundler/setup'
+require 'octokit'
+require 'pry'
+
+class RepoList
+  def initialize(client)
+    @client = client
+  end
+  attr_reader :client
+
+  def repos
+    warn 'Fetching all GoodGuide repos...'
+
+    goodguide_repos = client.org_repos('GoodGuide')
+      .sort_by { |r| r.name.downcase }
+      .tap { |repos| warn "Got #{repos.count} repos. Loading more information..." }
+
+    goodguide_repos
+      .each_with_index
+      .map { |gh_repo, idx|
+        warn "%03i/%3i - %s" % [idx, goodguide_repos.length, gh_repo.full_name]
+
+        if !!gh_repo.to_attrs[:fork]
+          STDERR.print '  repo is fork; fetching full repo for parent information...'
+          gh_repo = client.repo(gh_repo.full_name)
+          STDERR.print "!\n"
+        end
+
+        STDERR.print '  fetching contents of root directory of HEAD commit...'
+        files_in_root = client.contents(gh_repo.full_name, path: '/')
+        STDERR.print "!\n"
+
+        STDERR.print '  fetching details of HEAD commit...'
+        last_commit = client.commit(gh_repo.full_name, 'HEAD')
+        STDERR.print "!\n"
+
+        { repo: gh_repo, last_commit: last_commit, files_in_root: files_in_root }
+      }
+  end
+end
+
+@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |client|
+  client.auto_paginate = true
+}
+
+@repolist = RepoList.new(@client)
+
+if STDOUT.tty?
+  fail 'You should redirect the output to a file'
+end
+
+STDOUT.write(Marshal.dump(@repolist.repos))

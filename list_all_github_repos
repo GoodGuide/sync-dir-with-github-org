@@ -8,8 +8,8 @@ require 'time'
 __file = File.symlink?(__FILE__) ? File.readlink(__FILE__) : __FILE__
 ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __file)
 require 'bundler/setup'
-require 'octokit'
 require 'pry'
+require 'octokit'
 
 require 'time-lord' # nb: this monkey-patches Time/Numeric classes a lot
 
@@ -59,10 +59,14 @@ module HelperMethods
 end
 
 class RepoList
-  def initialize(client)
-    @client = client
+  def self.load_from_file(filename)
+    new(Marshal.load(File.read(filename)))
   end
-  attr_reader :client
+
+  def initialize(repos_from_cache)
+    @cached_repos = repos_from_cache
+  end
+  attr_reader :cached_repos
 
   def repos
     cached_repos.map { |data|
@@ -72,62 +76,6 @@ class RepoList
         repo.files_in_root = files_in_root
       }
     }
-  end
-
-  private
-
-  def cache
-    @cache ||= Cache.new('/tmp')
-  end
-
-  def cached_repos
-    @repos ||= cache.fetch('goodguide-repos.dat') do |ex|
-      warn "Loading repo cache failed: #{ex}"
-      warn 'Fetching all GoodGuide repos...'
-
-      goodguide_repos = client.org_repos('GoodGuide')
-        .sort_by { |r| r.name.downcase }
-        .tap { |repos| warn "Got #{repos.count} repos. Loading more information..." }
-
-      goodguide_repos
-        .each_with_index
-        .map { |gh_repo, idx|
-          warn "%3i/%3i - %s" % [idx, goodguide_repos.length, gh_repo.full_name]
-
-          if !!gh_repo.to_attrs[:fork]
-            STDERR.print '  repo is fork; fetching full repo for parent information...'
-            gh_repo = client.repo(gh_repo.full_name)
-            STDERR.print "!\n"
-          end
-
-          STDERR.print '  fetching contents of root directory of HEAD commit...'
-          files_in_root = client.contents(gh_repo.full_name, path: '/')
-          STDERR.print "!\n"
-
-          STDERR.print '  fetching details of HEAD commit...'
-          last_commit = client.commit(gh_repo.full_name, 'HEAD')
-          STDERR.print "!\n"
-
-          { repo: gh_repo, last_commit: last_commit, files_in_root: files_in_root }
-        }
-    end
-  end
-end
-
-class Cache
-  def initialize(tmp_directory)
-    @directory = Pathname.new(tmp_directory)
-  end
-
-  def fetch(path, &block)
-    filename = @directory.join(path)
-    Marshal.load(File.read(filename))
-  rescue => ex
-    data = block.call(ex)
-
-    File.write(filename, Marshal.dump(data))
-
-    data
   end
 end
 
@@ -148,7 +96,21 @@ class ReportBuilder
         rule.visit(repo)
       end
     end
+    validate
     @_prepared = true
+  end
+
+  def validate
+    @repos.group_by(&:new_name).each do |(new_name, repos)|
+      if repos.length > 1
+        warn "WARNING: Naming conflict! Multiple repos are recommended to be renamed to `#{new_name}`: #{repos.map(&:name).join(', ')}"
+      end
+    end
+
+    if @error
+      warn "An Error occurred"
+      exit 1
+    end
   end
 
   def write(filename)
@@ -455,16 +417,20 @@ OUTPUT_FILENAME = '/tmp/goodguide-org-repos-report.md'.freeze
   Rules::Rename.new(/\Asolr-goodguide-config\z/i, 'goodguide-solr-config'),
   Rules::Rename.new(/\Aios-consumer-data-analysis\z/i, 'goodguide-ios-data-analysis'),
   Rules::Rename.new(/\Anlp.+api\z/i, 'nlpapi'),
+  Rules::Rename.new(/\Adocker-(mysql.+)\z/i, 'dockerfile-\1'),
+  Rules::Rename.new(/\Ahorde-gem\z/i, 'horde'),
 
-  Rules::Namespace.new(name_pattern: /\A(accounts|amazon-earth-day|www|api|nlpapi|ios|users-service|content|(accounts(-internal)?|nlpapi|content|api)-gem)\z/, namespace: 'goodguide'),
+  Rules::Namespace.new(name_pattern: /\A(accounts|amazon-earth-day|extension|www|api|nlpapi|ios|users-service|content|(accounts(-internal)?|nlpapi|content|api)-gem|public-api)\z/, namespace: 'goodguide'),
 
-  Rules::Namespace.new(name_pattern: /\A(dolt|dorc|dimwit|buffoon|dingbat|muppeteer)/, namespace: 'data-run'),
+  Rules::Namespace.new(name_pattern: /\A(dolt|dorc|dimwit|buffoon|dingbat|muppeteer)/, namespace: 'ratings'),
 
 
   Rules::Namespace.new(name_pattern: /\A(platform)|\A(target-products|rules|regression-tests)\z/, namespace: 'purview'),
 
+  Rules::Namespace.new(name_pattern: /\A(deploy|hubot|chef|cookbooks|git-hooks|(health|assets|pricegrabber|product-soup|scraper|visualizations|matching|packrat|release-tracker|releasinator)-gem)\z/, namespace: 'gg'),
+
   Rules::PatternMatch.new(description: /\b(ARCHIVE|DEPRECATED)\b/i, recommendations: :safe_to_archive),
-  Rules::PatternMatch.new(name: /\A(deploy)\z/, recommendations: :keep),
+  Rules::PatternMatch.new(name: /\A(gg-deploy)\z/, recommendations: :keep),
   Rules::PatternMatch.new(description: /in.use/, recommendations: :keep),
 
   Rules::PatternMatch.new(name: /\bspike\b/, description: /hack|experiment|w\.?i\.?p\.?|temporary/i, recommendations: :safe_to_archive),
@@ -472,14 +438,15 @@ OUTPUT_FILENAME = '/tmp/goodguide-org-repos-report.md'.freeze
 
   Rules::PatternMatch.new(name: /\A(jenkins)\z/i, recommendations: :keep),
 
+  Rules::PatternMatch.new(name: /\Apurview-rules\z/i, recommendations: :safe_to_archive),
+
   Rules::PatternMatch.new(name: /\Ahorde/i, recommendations: :safe_to_archive),
+  Rules::PatternMatch.new(name: /\Aprezto\z/i, recommendations: 'Used by `dotfiles` repo. Evalutate if that is worth keeping around and if we still need to have a fork of prezto as well.'),
 ]
 
-@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |client|
-  client.auto_paginate = true
-}
+repo_data_filename = ARGV[0] or fail 'You must pass a filename to load repo data (use ./load_all_github_repos)'
 
-@repolist = RepoList.new(@client)
+@repolist = RepoList.load_from_file(repo_data_filename)
 
 @builder = ReportBuilder.new(repos: @repolist.repos, rules: @rules)
 @builder.prepare
