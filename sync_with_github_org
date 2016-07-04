@@ -56,8 +56,11 @@ end.parse!
 client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN'))
 client.auto_paginate = true
 
-STDERR.print 'Fetching all GoodGuide repos... '
-goodguide_repos = client.org_repos('GoodGuide')
+org_name = ARGV[0] or fail 'Missing required ORG_NAME argument'
+
+STDERR.print "Fetching all #{org_name} repos... "
+goodguide_repos = client.org_repos(org_name)
+
 warn "Got #{goodguide_repos.count} repos"
 
 repo_directories = []
