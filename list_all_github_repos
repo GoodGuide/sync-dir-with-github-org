@@ -115,7 +115,7 @@ class ReportBuilder
   def write(output)
     prepare
 
-    output.puts "# repos"
+    output.puts "# Repos"
 
     repos.each do |repo|
       # next if repo.fork?
@@ -143,6 +143,29 @@ class ReportBuilder
 
       output.puts source.string
       output.puts
+    end
+
+    output.puts "# Possibly problematic rename collisions"
+    output.puts
+    output.puts "These might cause issues as the automatic Github redirect will not be available"
+
+    each_conflicting_rename do |original_name, new_name, conflicting_original_name|
+      output.puts
+      output.puts "- `#{original_name}` is renamed to `#{new_name}`."
+      output.puts "    `#{conflicting_original_name}` is then renamed to `#{original_name}`"
+    end
+  end
+
+  def each_conflicting_rename
+    renames = repos.inject({}) { |hash, repo|
+      next hash if repo.new_name == repo.name
+      hash[repo.name] = repo.new_name
+      hash
+    }
+
+    renames.each do |(name, new_name)|
+      next unless renames.key?(new_name)
+      yield new_name, renames[new_name], name
     end
   end
 
