@@ -1,0 +1,81 @@
+#!/usr/bin/env ruby
+
+# Given a YAML description of the renames to be performed (on STDIN),
+# build a script to be distributed to the rest of the team which will
+# alter their local "GoodGuide" directory full of projects cloned
+# according to the renames that have already happened
+
+require 'yaml'
+
+org_name, renames = YAML.load(STDIN.read).values_at(:org, :renames)
+
+output = STDOUT
+
+script_header = DATA.read
+  .gsub('{{ORG_NAME}}', org_name)
+
+output.puts script_header
+
+renames.each do |(original_name, new_name)|
+  output.puts "rename_repo '#{original_name}' '#{new_name}'"
+end
+
+__END__
+#!/bin/sh
+
+# set -x
+set -euo pipefail
+
+silence() {
+  "$@" > /dev/null 2>&1
+}
+
+mv() {
+  if silence command -v gmv; then
+    gmv "$@"
+  else
+    mv "$@"
+  fi
+}
+
+red(){
+  printf "\x1b[31m%b\x1b[0m" "$1"
+}
+
+yellow(){
+  printf "\x1b[33m%b\x1b[0m" "$1"
+}
+
+green(){
+  printf "\x1b[32m%b\x1b[0m" "$1"
+}
+
+warn() {
+  msg="$1"; shift
+
+  red "$msg\n" >&2
+}
+
+rename_repo() {
+  original_name="$1"; shift
+  new_name="$1"; shift
+
+  if [[ -d $original_name ]]; then
+    yellow "[${original_name}] "
+    green "Rename to '${new_name}'.\n"
+    echo mv -n "${original_name}" "${new_name}"
+
+    # pushd "${new_name}"
+    silence pushd "${original_name}"
+
+    remoteUrls="$(git config -l | grep -iE "github\.com.{{ORG_NAME}}/${original_name}" || :)"
+    for remoteUrl in "${remoteUrls}"; do
+      configKey="$(echo "$remoteUrl" | cut -d= -f 1)"
+      originalUrl="$(echo "$remoteUrl" | cut -d= -f 2)"
+      newUrl="${originalUrl/${original_name}/${new_name}}"
+      echo git config "${configKey}" "${newUrl}"
+    done
+
+    silence popd
+  fi
+}

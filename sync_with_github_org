@@ -59,14 +59,14 @@ client.auto_paginate = true
 org_name = ARGV[0] or fail 'Missing required ORG_NAME argument'
 
 STDERR.print "Fetching all #{org_name} repos... "
-goodguide_repos = client.org_repos(org_name)
+org_repos = client.org_repos(org_name)
 
-warn "Got #{goodguide_repos.count} repos"
+warn "Got #{org_repos.count} repos"
 
 repo_directories = []
 fork_directories = []
 
-goodguide_repos.each do |repo|
+org_repos.each do |repo|
   warn "\n#{repo.full_name} ".ljust(80, '_')
 
   just_cloned = false
@@ -80,7 +80,6 @@ goodguide_repos.each do |repo|
     warn "Skipping legacy repo"
     next
   end
-
 
   if directory.directory?
     if repo.fork
@@ -106,7 +105,7 @@ goodguide_repos.each do |repo|
       next unless should_clone
     end
 
-    system "git clone --recursive #{repo.ssh_url} ./#{repo.name}"
+    system "git clone --depth 50 #{repo.ssh_url} ./#{repo.name}"
     just_cloned = true
   end
 

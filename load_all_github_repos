@@ -11,22 +11,24 @@ require 'octokit'
 require 'pry'
 
 class RepoList
-  def initialize(client)
+  def initialize(client, org_name)
+    @org_name = org_name
     @client = client
   end
   attr_reader :client
+  attr_reader :org_name
 
   def repos
-    warn 'Fetching all GoodGuide repos...'
+    warn "Fetching all #{org_name} repos..."
 
-    goodguide_repos = client.org_repos('GoodGuide')
+    org_repos = client.org_repos(org_name)
       .sort_by { |r| r.name.downcase }
       .tap { |repos| warn "Got #{repos.count} repos. Loading more information..." }
 
-    goodguide_repos
+    org_repos
       .each_with_index
       .map { |gh_repo, idx|
-        warn "%03i/%3i - %s" % [idx, goodguide_repos.length, gh_repo.full_name]
+        warn "%03i/%3i - %s" % [idx, org_repos.length, gh_repo.full_name]
 
         if !!gh_repo.to_attrs[:fork]
           STDERR.print '  repo is fork; fetching full repo for parent information...'
@@ -47,14 +49,16 @@ class RepoList
   end
 end
 
-@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |client|
-  client.auto_paginate = true
-}
-
-@repolist = RepoList.new(@client)
+org_name = ARGV[0] or fail 'Missing required ORG_NAME argument'
 
 if STDOUT.tty?
   fail 'You should redirect the output to a file'
 end
+
+@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |client|
+  client.auto_paginate = true
+}
+
+@repolist = RepoList.new(@client, org_name)
 
 STDOUT.write(Marshal.dump(@repolist.repos))

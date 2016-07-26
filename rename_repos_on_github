@@ -1,0 +1,31 @@
+#!/usr/bin/env ruby
+
+# Given a YAML description of the renames to be performed (on STDIN),
+# actually perform the rename of each repository, on Github.
+
+require 'yaml'
+
+__file = File.symlink?(__FILE__) ? File.readlink(__FILE__) : __FILE__
+ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __file)
+require 'bundler/setup'
+require 'octokit'
+require 'pry'
+
+client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |c|
+  c.auto_paginate = true
+}
+
+@org_name, @renames = YAML.load(STDIN.read).values_at(:org, :renames)
+
+def rename_repo(original_name, new_name)
+  if ENV['CONFIRM'] == 'yes'
+    warn '%s -> %s' % [original_name, new_name]
+    client.edit_repository("#{@org_name}/#{original_name}", name: new_name)
+  else
+    warn '%s -> %s [dry-run]' % [original_name, new_name]
+  end
+end
+
+@renames.each do |(original_name, new_name)|
+  rename_repo original_name, new_name
+end

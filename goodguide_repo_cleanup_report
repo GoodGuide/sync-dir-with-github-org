@@ -4,6 +4,7 @@ require 'pathname'
 require 'optparse'
 require 'stringio'
 require 'time'
+require 'yaml'
 
 __file = File.symlink?(__FILE__) ? File.readlink(__FILE__) : __FILE__
 ENV['BUNDLE_GEMFILE'] ||= File.expand_path('../Gemfile', __file)
@@ -112,7 +113,7 @@ class ReportBuilder
     end
   end
 
-  def write(output)
+  def write_markdown(output)
     prepare
 
     output.puts "# Repos"
@@ -149,23 +150,47 @@ class ReportBuilder
     output.puts
     output.puts "These might cause issues as the automatic Github redirect will not be available"
 
-    each_conflicting_rename do |original_name, new_name, conflicting_original_name|
+    conflicting_renames.each do |(original_name, new_name, conflicting_original_name)|
       output.puts
       output.puts "- `#{original_name}` is renamed to `#{new_name}`."
       output.puts "    `#{conflicting_original_name}` is then renamed to `#{original_name}`"
     end
   end
 
-  def each_conflicting_rename
+  def write_renames_yaml(output)
+    prepare
+
+    renames = []
+
+    conflicting_renames.each do |(original_name, new_name, conflicting_original_name)|
+      renames.push([ original_name, new_name ])
+      renames.push([ conflicting_original_name, original_name ])
+    end
+
+    repos.each do |repo|
+      next if repo.new_name == repo.name
+      next if renames.any? { |rename| rename.last == repo.new_name }
+
+      renames.push([ repo.name, repo.new_name ])
+    end
+
+    output.puts(YAML.dump(
+      org: 'GoodGuide',
+      renames: renames,
+    ))
+  end
+
+  def conflicting_renames
     renames = repos.inject({}) { |hash, repo|
       next hash if repo.new_name == repo.name
       hash[repo.name] = repo.new_name
       hash
     }
 
-    renames.each do |(name, new_name)|
-      next unless renames.key?(new_name)
-      yield new_name, renames[new_name], name
+    renames.inject([]) do |conflicts, (name, new_name)|
+      next conflicts unless renames.key?(new_name)
+      conflicts << [new_name, renames[new_name], name]
+      conflicts
     end
   end
 
@@ -464,9 +489,20 @@ end
 ]
 
 repo_data_filename = ARGV[0] or fail 'You must pass a filename to load repo data (use ./load_all_github_repos)'
+output_filename_prefix = ARGV[1] or fail 'You must pass a filename (prefix) for the output files'
 
 @repolist = RepoList.load_from_file(repo_data_filename)
 
 @builder = ReportBuilder.new(repos: @repolist.repos, rules: @rules)
 @builder.prepare
-@builder.write(STDOUT)
+
+md_filename = output_filename_prefix + '.md'
+renames_yaml_filename = output_filename_prefix + '_renames.yml'
+
+File.open(md_filename, 'w') do |md_file|
+  @builder.write_markdown(md_file)
+end
+
+File.open(renames_yaml_filename, 'w') do |md_file|
+  @builder.write_renames_yaml(md_file)
+end
