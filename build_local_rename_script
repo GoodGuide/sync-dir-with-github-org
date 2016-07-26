@@ -63,17 +63,16 @@ rename_repo() {
   if [[ -d $original_name ]]; then
     yellow "[${original_name}] "
     green "Rename to '${new_name}'.\n"
-    echo mv -n "${original_name}" "${new_name}"
+    mv -n "${original_name}" "${new_name}"
 
-    # pushd "${new_name}"
-    silence pushd "${original_name}"
+    silence pushd "${new_name}"
 
     remoteUrls="$(git config -l | grep -iE "github\.com.{{ORG_NAME}}/${original_name}" || :)"
     for remoteUrl in "${remoteUrls}"; do
       configKey="$(echo "$remoteUrl" | cut -d= -f 1)"
       originalUrl="$(echo "$remoteUrl" | cut -d= -f 2)"
       newUrl="${originalUrl/${original_name}/${new_name}}"
-      echo git config "${configKey}" "${newUrl}"
+      git config "${configKey}" "${newUrl}"
     done
 
     silence popd
