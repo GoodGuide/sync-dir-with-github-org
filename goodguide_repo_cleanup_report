@@ -468,7 +468,7 @@ end
   Rules::Namespace.new(name_pattern: /\A(dolt|dorc|dimwit|buffoon|dingbat|muppeteer)/, namespace: 'ratings'),
 
 
-  Rules::Namespace.new(name_pattern: /\A(platform)|\A(target-products|rules|regression-tests)\z/, namespace: 'purview'),
+  Rules::Namespace.new(name_pattern: /\A(platform)|\A(target-products|rules|regression-tests|entity-soup-gem)\z/, namespace: 'purview'),
 
   Rules::Namespace.new(name_pattern: /\A(deploy|hubot|chef|cookbooks|git-hooks|(health|assets|pricegrabber|product-soup|scraper|visualizations|matching|packrat|release-tracker|releasinator)-gem)\z/, namespace: 'gg'),
 

@@ -11,7 +11,7 @@ require 'bundler/setup'
 require 'octokit'
 require 'pry'
 
-client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |c|
+@client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |c|
   c.auto_paginate = true
 }
 
@@ -20,10 +20,12 @@ client = Octokit::Client.new(access_token: ENV.fetch('GITHUB_TOKEN')).tap { |c|
 def rename_repo(original_name, new_name)
   if ENV['CONFIRM'] == 'yes'
     warn '%s -> %s' % [original_name, new_name]
-    client.edit_repository("#{@org_name}/#{original_name}", name: new_name)
+    @client.edit_repository("#{@org_name}/#{original_name}", name: new_name)
   else
     warn '%s -> %s [dry-run]' % [original_name, new_name]
   end
+rescue => ex
+  p ex
 end
 
 @renames.each do |(original_name, new_name)|
